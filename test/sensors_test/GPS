@@ -1,0 +1,56 @@
+#include <LiquidCrystal.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+
+//LCD and Micro GPS initialization
+TinyGPSPlus gps;
+HardwareSerial mySerial(1);
+
+//                RS, E, D4, D5, D6, D7 [these are LCD Pins]
+LiquidCrystal lcd(14, 32, 15, 33, 27, 12);
+void displayGPSData(){
+  if (gps.location.isUpdated()){
+    Serial.print("Latitdue:");
+    Serial.print(gps.location.lat(),6);
+    Serial.print("Longitude:");
+    Serial.println(gps.location.lng(),6);
+  
+    Serial.print("Satalites: ");
+    Serial.println(gps.satellites.value());
+  }
+}
+
+void setup() {
+//GPS Comunication code
+// for serial monitor
+Serial.begin(115200);
+Serial.println("Initializing the GPS......");
+
+//GPS model at 9600 baud
+mySerial.begin(9600, SERIAL_8N1, 16, 17); 
+Serial.println("GPS Test");
+delay(1000);
+
+//LCD DISPLAY SETTINGS
+lcd.begin(16, 2); // Set the LCD size (16 columns, 2 rows)
+  lcd.setCursor(0,0);
+  lcd.print("GPS Location:"); 
+
+  lcd.setCursor(0,1);
+  lcd.print("Portland, OR");
+
+oid loop() {
+  while (mySerial.available() > 0){
+    char c = mySerial.read();
+    gps.encode(c);
+   // gps.encode(mySerial.read()); //Feeds data into GPS
+  }
+
+    if (gps.location.isValid()){
+      displayGPSData();
+    } else{
+      Serial.println("Waiting for gps signal...");
+    }
+    delay(5000);
+}
