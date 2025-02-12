@@ -1,127 +1,340 @@
+/*******************************************************
+ *  Includes
+ *******************************************************/
+#include <Arduino.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h" // PBA algorithm from SparkFun
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
 
-// WiFi credentials – replace with your own.
-const char* ssid     = "";
-const char* password = "";
+/*******************************************************
+ *  WiFi and Firebase Settings
+ *******************************************************/
+const char* WIFI_SSID     = "ZDYNB";
+const char* WIFI_PASSWORD = "20030911";
+const char* FIREBASE_URL  = "https://lifealert-40baf-default-rtdb.firebaseio.com/sensorData.json";
 
-// Firebase Realtime Database URL – replace with your actual URL.
-const char* firebaseURL = "https://lifealert-40baf-default-rtdb.firebaseio.com/sensorData.json";
+/*******************************************************
+ * MAX30102 Sensor
+ *******************************************************/
+MAX30105 particleSensor;
 
-// Create an instance of the MPU6050 object.
+// Global heart-rate variables
+float g_beatsPerMinute = 0.0;
+int   g_beatAvg        = 0;
+byte  g_rates[4];
+byte  g_rateSpot       = 0;
+long  g_lastBeat       = 0;
+float temperature = 0.0f;
+/*******************************************************
+ * MPU6050
+ *******************************************************/
 Adafruit_MPU6050 mpu;
+float ax, ay, az, gx, gy, gz;
 
-// Data Structures
-struct IMUData {
-  float ax;
-  float ay;
-  float az;
-  float gx;
-  float gy;
-  float gz;
-};
+/*******************************************************
+ * Dummy GPS data
+ *******************************************************/
+float g_lat = 45.58;
+float g_lng = -122.68;
 
-struct LocationData {
-  float lat;
-  float lng;
-};
+/*******************************************************
+ * Emergency Button on pin 12 (active LOW)
+ *******************************************************/
+const int buttonPin = 12;
+volatile bool g_emergencyTriggered = false;
+void IRAM_ATTR handleEmergency() {
+  g_emergencyTriggered = true;
+}
 
-struct HealthData {
-  int heart_rate;
-  int spo2;
-  float temp;
-};
+/*******************************************************
+ * FreeRTOS Task Handles & Mutex
+ *******************************************************/
+TaskHandle_t heartRateTaskHandle;
+TaskHandle_t uploadTaskHandle;
+SemaphoreHandle_t i2cMutex;
 
-// Function prototypes
-void initMPU();
-IMUData readIMU();
-LocationData readLocation();
-HealthData readHealth();
-String packageData();
-void sendDataToFirebase(const String &data);
+/*******************************************************
+ * Function Declarations
+ *******************************************************/
+
+// FreeRTOS tasks
+void heartRateTask(void* pvParameters);
+void uploadTask(void* pvParameters);
+
+// Setup
 void setupWiFi();
+void initMAX30102();
+void initMPU6050();
 
-// ✅ Fixed IMU reading function (Accelerometer and Gyroscope properly mapped)
-IMUData readIMU() {
+// Heart rate logic
+void checkBeatAndComputeBPM(long irValue);
+
+// Sensor reading
+void readMPU(float &ax, float &ay, float &az,
+             float &gx, float &gy, float &gz);
+float readDieTemperature(); // read from MAX30102
+
+// Firebase uploading
+String createJson(float bpm, int avgBpm, bool emergency,
+                  float lat, float lng,
+                  float temperature,
+                  float ax, float ay, float az,
+                  float gx, float gy, float gz);
+void sendDataToFirebase(const String &jsonPayload);
+
+/*******************************************************
+ * setup()
+ *******************************************************/
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
+  
+  // Connect to WiFi
+  setupWiFi();
+
+  // Create a mutex for the I2C bus
+  i2cMutex = xSemaphoreCreateMutex();
+
+  // Initialize MAX30102
+  initMAX30102();
+
+  // Initialize MPU6050
+  initMPU6050();
+
+  // Emergency button
+  pinMode(buttonPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(buttonPin), handleEmergency, FALLING);
+
+  // Create the high-frequency heart-rate task
+  xTaskCreatePinnedToCore(
+    heartRateTask,        
+    "HeartRateTask",      
+    4096,                 
+    NULL,
+    2,    // priority
+    &heartRateTaskHandle,
+    0     // pinned to core 0
+  );
+
+  // Create the lower-frequency upload task
+  xTaskCreatePinnedToCore(
+    uploadTask,
+    "UploadTask",
+    4096,
+    NULL,
+    1,    // lower priority
+    &uploadTaskHandle,
+    1     // pinned to core 1
+  );
+}
+
+/*******************************************************
+ * loop() - no code needed; tasks run in background
+ *******************************************************/
+void loop() {
+  // No code here.
+}
+
+/*******************************************************
+ * heartRateTask (high frequency ~100Hz)
+ * Reads IR from MAX30102, calculates BPM using PBA
+ *******************************************************/
+const unsigned long imuTempInterval = 1000;
+static unsigned long lastImuTempTime = 0; 
+void heartRateTask(void* pvParameters) {
+  const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms -> ~100Hz
+  TickType_t xLastWakeTime    = xTaskGetTickCount();
+
+  while (true) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    long irValue = particleSensor.getIR();
+    unsigned long currentMillis = millis();
+    checkBeatAndComputeBPM(irValue);
+    if (currentMillis - lastImuTempTime >= imuTempInterval) {
+    lastImuTempTime = currentMillis;
+    readMPU(ax, ay, az, gx, gy, gz);
+    temperature = readDieTemperature();
+    }
+  }
+
+  vTaskDelete(NULL);
+}
+
+/*******************************************************
+ * uploadTask (lower frequency ~1Hz)
+ * Reads IMU, reads temperature, checks emergency, 
+ * builds JSON, sends to Firebase
+ *******************************************************/
+void uploadTask(void* pvParameters) {
+  const TickType_t xFrequency = pdMS_TO_TICKS(1000); // 1 second
+  TickType_t xLastWakeTime    = xTaskGetTickCount();
+
+  while (true) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    // 3) Copy heart-rate data
+    float currentBpm = g_beatsPerMinute;
+    int currentAvg   = g_beatAvg;
+
+    // 4) Check emergency
+    bool localEmergency = g_emergencyTriggered;
+    g_emergencyTriggered = false;
+
+    // 5) Build JSON
+    String jsonData = createJson(currentBpm, currentAvg,
+                                 localEmergency,
+                                 g_lat, g_lng,
+                                 temperature,
+                                 ax, ay, az,
+                                 gx, gy, gz);
+
+    // 6) Send to Firebase
+    sendDataToFirebase(jsonData);
+
+    // 7) Debug Print
+    Serial.println(jsonData);
+  }
+  vTaskDelete(NULL);
+}
+
+/*******************************************************
+ * checkBeatAndComputeBPM()
+ * from heartRate.h (SparkFun PBA)
+ *******************************************************/
+void checkBeatAndComputeBPM(long irValue) {
+  if (checkForBeat(irValue) == true) {
+    long delta = millis() - g_lastBeat;
+    g_lastBeat = millis();
+
+    float bpm = 60.0 / (delta / 1000.0);
+    if (bpm < 255 && bpm > 20) {
+      g_beatsPerMinute = bpm;
+      g_rates[g_rateSpot++] = (byte)bpm;
+      g_rateSpot %= 4;
+
+      int total = 0;
+      for (int i = 0; i < 4; i++) {
+        total += g_rates[i];
+      }
+      g_beatAvg = total / 4;
+    }
+  }
+}
+
+/*******************************************************
+ * initMAX30102()
+ *******************************************************/
+void initMAX30102() {
+  Serial.println("Initializing MAX30102...");
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found. Check wiring!");
+    while (1) { delay(10); }
+  }
+
+  // Example configuration
+  particleSensor.setup(); 
+  particleSensor.setPulseAmplitudeRed(0x0A); 
+  particleSensor.setPulseAmplitudeGreen(0);  
+  particleSensor.enableDIETEMPRDY(); // Enable internal temperature
+
+  Serial.println("MAX30102 ready. Place your finger on the sensor.");
+}
+
+/*******************************************************
+ * initMPU6050()
+ *******************************************************/
+void initMPU6050() {
+  Serial.println("Initializing MPU6050...");
+  
+  // If you have not called Wire.begin(...) above, you'd do it here:
+  // Wire.begin(21,22); // or default pins if your board needs it
+
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050!");
+    while (1) { delay(10); }
+  }
+  Serial.println("MPU6050 found!");
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+}
+
+/*******************************************************
+ * readMPU() 
+ * reads accelerometer & gyro data
+ *******************************************************/
+void readMPU(float &ax, float &ay, float &az,
+             float &gx, float &gy, float &gz) {
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
-  
-  IMUData imu;
-  imu.ax = accel.acceleration.x;  // ✅ Correct mapping
-  imu.ay = accel.acceleration.y;
-  imu.az = accel.acceleration.z;
-  imu.gx = gyro.gyro.x;  // ✅ Correct mapping
-  imu.gy = gyro.gyro.y;
-  imu.gz = gyro.gyro.z;
-  
-  return imu;
+
+  ax = accel.acceleration.x;
+  ay = accel.acceleration.y;
+  az = accel.acceleration.z;
+  gx = gyro.gyro.x;
+  gy = gyro.gyro.y;
+  gz = gyro.gyro.z;
 }
 
-// Simulated GPS data
-LocationData readLocation() {
-  LocationData loc;
-  loc.lat = 31.23;
-  loc.lng = 121.47;
-  return loc;
+/*******************************************************
+ * readDieTemperature() 
+ * Now actually read from MAX30102 instead of returning 25.0
+ *******************************************************/
+float readDieTemperature() {
+  return particleSensor.readTemperature(); // real sensor reading
+  // If sensor is not working or you didn't enable dietemp:
+  // you might get random or 0 values
 }
 
-// Simulated Health Data
-HealthData readHealth() {
-  HealthData health;
-  health.heart_rate = 72;
-  health.spo2 = 98;
-  health.temp = 36.5;
-  return health;
-}
+/*******************************************************
+ * createJson()
+ * Same format as before
+ *******************************************************/
+String createJson(float bpm, int avgBpm, bool emergency,
+                  float lat, float lng,
+                  float temperature,
+                  float ax, float ay, float az,
+                  float gx, float gy, float gz)
+{
+  StaticJsonDocument<512> doc;
+  doc["timestamp"]   = millis();
+  doc["heart_rate"]  = bpm;
+  doc["avg_bpm"]     = avgBpm;
+  doc["emergency"]   = emergency;
+  doc["temperature"] = temperature;
 
-// ✅ Package Data into JSON
-String packageData() {
-  StaticJsonDocument<256> doc;
-  
-  // Add timestamp
-  doc["timestamp"] = millis();
-  
-  // Add location data
-  LocationData loc = readLocation();
-  JsonObject locObj = doc.createNestedObject("location");
-  locObj["lat"] = loc.lat;
-  locObj["lng"] = loc.lng;
-  
-  // Add IMU data
-  IMUData imu = readIMU();
-  JsonObject imuObj = doc.createNestedObject("imu");
-  JsonObject accelObj = imuObj.createNestedObject("acceleration");
-  accelObj["x"] = imu.ax;
-  accelObj["y"] = imu.ay;
-  accelObj["z"] = imu.az;
-  JsonObject gyroObj = imuObj.createNestedObject("gyro");
-  gyroObj["x"] = imu.gx;
-  gyroObj["y"] = imu.gy;
-  gyroObj["z"] = imu.gz;
-  
-  // Add health data
-  HealthData health = readHealth();
-  JsonObject healthObj = doc.createNestedObject("health");
-  healthObj["heart_rate"] = health.heart_rate;
-  healthObj["spo2"] = health.spo2;
-  healthObj["temp"] = health.temp;
-  
+  JsonObject locObj   = doc.createNestedObject("location");
+  locObj["lat"]       = lat;
+  locObj["lng"]       = lng;
+
+  JsonObject imuObj   = doc.createNestedObject("imu");
+  imuObj["ax"]        = ax;
+  imuObj["ay"]        = ay;
+  imuObj["az"]        = az;
+  imuObj["gx"]        = gx;
+  imuObj["gy"]        = gy;
+  imuObj["gz"]        = gz;
+
   String output;
   serializeJson(doc, output);
   return output;
 }
 
-// ✅ Send Data to Firebase
-void sendDataToFirebase(const String &data) {
+/*******************************************************
+ * sendDataToFirebase()
+ *******************************************************/
+void sendDataToFirebase(const String &jsonPayload) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(firebaseURL);
+    http.begin(FIREBASE_URL);
     http.addHeader("Content-Type", "application/json");
-    int httpResponseCode = http.POST(data);
+
+    int httpResponseCode = http.POST(jsonPayload);
     if (httpResponseCode > 0) {
       Serial.printf("Firebase POST response code: %d\n", httpResponseCode);
     } else {
@@ -129,29 +342,17 @@ void sendDataToFirebase(const String &data) {
     }
     http.end();
   } else {
-    Serial.println("WiFi not connected. Cannot send data to Firebase.");
+    Serial.println("WiFi not connected. Cannot send data.");
   }
 }
 
-// ✅ Initialize MPU6050 Sensor
-void initMPU() {
-  Serial.println("Initializing MPU6050...");
-  if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
-    while (1) {
-      delay(10);
-    }
-  }
-  Serial.println("MPU6050 Found!");
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
-}
-
-// ✅ Connect to WiFi
+/*******************************************************
+ * setupWiFi()
+ *******************************************************/
 void setupWiFi() {
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -160,28 +361,3 @@ void setupWiFi() {
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 }
-
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) {
-    delay(10);
-  }
-  Wire.begin();
-  
-  // Initialize MPU6050.
-  initMPU();
-  
-  // Connect to WiFi.
-  setupWiFi();
-}
-
-void loop() {
-  String jsonData = packageData();
-  Serial.println(jsonData);
-  
-  // Upload data to Firebase.
-  sendDataToFirebase(jsonData);
-  
-  delay(1000); // Upload every 5 seconds; adjust as needed.
-}
-
