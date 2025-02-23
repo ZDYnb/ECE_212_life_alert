@@ -5,12 +5,13 @@
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h" // PBA algorithm from SparkFun
-#include <Adafruit_MPU6050.h>
+#include <MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
 /*******************************************************
  *  WiFi and Firebase Settings
  *******************************************************/
@@ -33,14 +34,29 @@ float temperature = 0.0f;
 /*******************************************************
  * MPU6050
  *******************************************************/
-Adafruit_MPU6050 mpu;
-float ax, ay, az, gx, gy, gz;
+MPU6050 mpu;
+int16_t ax, ay, az, gx, gy, gz;
+float totalAcc;
+float totalGyro;
+unsigned long fallStartTime = 0;
+bool fallDetected = false;
+
+#define ACC_THRESHOLD 2.5 // Acceleration threshold (g)
+#define GYRO_THRESHOLD 300 // Angular velocity threshold (°/s)
+#define FALL_TIME_THRESHOLD 100 // 100ms false alarm filter
+
 
 /*******************************************************
  * Dummy GPS data
  *******************************************************/
+#define RXD2 16 
+#define TXD2 17  
+
 float g_lat = 45.58;
 float g_lng = -122.68;
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);  // Use UART2
 
 /*******************************************************
  * Emergency Button on pin 12 (active LOW)
@@ -97,6 +113,8 @@ void setup() {
   // Connect to WiFi
   setupWiFi();
 
+  // GPS module baud rate
+  gpsSerial.begin(9600, SERIAL_8N1, RXD2, TXD2); 
   // Create a mutex for the I2C bus
   i2cMutex = xSemaphoreCreateMutex();
 
@@ -152,14 +170,23 @@ void heartRateTask(void* pvParameters) {
 
   while (true) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
     long irValue = particleSensor.getIR();
-    unsigned long currentMillis = millis();
     checkBeatAndComputeBPM(irValue);
-    if (currentMillis - lastImuTempTime >= imuTempInterval) {
-    lastImuTempTime = currentMillis;
+
     readMPU(ax, ay, az, gx, gy, gz);
+
     temperature = readDieTemperature();
-    }
+
+  if (gpsSerial.available() > 0) {
+      char c = gpsSerial.read();
+      gps.encode(c); 
+
+      if (gps.location.isUpdated()) {
+          g_lat = gps.location.lat();
+          g_lng = gps.location.lng();
+      }
+  }
   }
 
   vTaskDelete(NULL);
@@ -190,7 +217,7 @@ void uploadTask(void* pvParameters) {
                                  g_lat, g_lng,
                                  temperature,
                                  ax, ay, az,
-                                 gx, gy, gz);
+                                 gx, gy, gz, totalAcc, totalGyro, fallDetected);
 
     // 6) Send to Firebase
     sendDataToFirebase(jsonData);
@@ -236,7 +263,14 @@ void initMAX30102() {
   }
 
   // Example configuration
-  particleSensor.setup(); 
+  //Setup to sense a nice looking saw tooth on the plotter
+  byte ledBrightness = 0x1F; //Options: 0=Off to 255=50mA
+  byte sampleAverage = 8; //Options: 1, 2, 4, 8, 16, 32
+  byte ledMode = 3; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+  int sampleRate = 100; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+  int pulseWidth = 411; //Options: 69, 118, 215, 411
+  int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure sensor with these settings
   particleSensor.setPulseAmplitudeRed(0x0A); 
   particleSensor.setPulseAmplitudeGreen(0);  
   particleSensor.enableDIETEMPRDY(); // Enable internal temperature
@@ -252,33 +286,44 @@ void initMPU6050() {
   
   // If you have not called Wire.begin(...) above, you'd do it here:
   // Wire.begin(21,22); // or default pins if your board needs it
-
-  if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050!");
-    while (1) { delay(10); }
-  }
-  Serial.println("MPU6050 found!");
-
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+    mpu.initialize();
+    if (!mpu.testConnection()) {
+        Serial.println("MPU6050 connection failed!");
+        while (1);
+    }
+    Serial.println("MPU6050 initialized successfully");
 }
 
 /*******************************************************
  * readMPU() 
  * reads accelerometer & gyro data
  *******************************************************/
-void readMPU(float &ax, float &ay, float &az,
-             float &gx, float &gy, float &gz) {
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
+void readMPU(int16_t &ax, int16_t &ay, int16_t &az,
+             int16_t &gx, int16_t &gy, int16_t &gz) {
 
-  ax = accel.acceleration.x;
-  ay = accel.acceleration.y;
-  az = accel.acceleration.z;
-  gx = gyro.gyro.x;
-  gy = gyro.gyro.y;
-  gz = gyro.gyro.z;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  ax = ax / 16384.0; // 2g range
+  ay = ay / 16384.0;
+  az = az / 16384.0;
+  gx = gx / 131.0; // 250°/s range
+  gy = gy / 131.0;
+  gz = gz / 131.0;
+  // Calculate total acceleration (sqrt(ax^2 + ay^2 + az^2))
+  totalAcc = sqrt(ax * ax + ay * ay + az * az);
+  // Calculate the absolute value of angular velocity
+  totalGyro = sqrt(gx * gx + gy * gy + gz * gz);
+// Detect a fall
+  if (totalAcc > ACC_THRESHOLD && totalGyro > GYRO_THRESHOLD) {
+    if (!fallDetected) {
+        fallStartTime = millis(); // Record the fall time
+        fallDetected = true;
+    } else if (millis() - fallStartTime > FALL_TIME_THRESHOLD) {
+        Serial.println("⚠️ Fall detected!");
+    }
+  } else {
+    fallDetected = false;
+  }
+
 }
 
 /*******************************************************
@@ -298,8 +343,8 @@ float readDieTemperature() {
 String createJson(float bpm, int avgBpm, bool emergency,
                   float lat, float lng,
                   float temperature,
-                  float ax, float ay, float az,
-                  float gx, float gy, float gz)
+                  int16_t ax, int16_t ay, int16_t az,
+                  int16_t gx, int16_t gy, int16_t gz, float totalAcc, float totalGyro, bool fallDetected)
 {
   StaticJsonDocument<512> doc;
   doc["timestamp"]   = millis();
@@ -319,6 +364,10 @@ String createJson(float bpm, int avgBpm, bool emergency,
   imuObj["gx"]        = gx;
   imuObj["gy"]        = gy;
   imuObj["gz"]        = gz;
+  imuObj["totalAcc"]  = totalAcc;
+  imuObj["totalGyro"] = totalGyro;
+  imuObj["fallDetected"] = fallDetected;
+
 
   String output;
   serializeJson(doc, output);
