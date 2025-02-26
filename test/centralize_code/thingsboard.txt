@@ -14,14 +14,16 @@
 #include <HardwareSerial.h>
 #include <time.h>
 
-
-
 /*******************************************************
- *  WiFi and Firebase Settings
+ *  WiFi and ThingsBoard Settings
  *******************************************************/
-const char* WIFI_SSID     = "ZDYNB";
-const char* WIFI_PASSWORD = "20030911";
-const char* FIREBASE_URL  = "https://lifealert-40baf-default-rtdb.firebaseio.com/sensorData.json";
+const char* WIFI_SSID        = "ZDYNB";
+const char* WIFI_PASSWORD    = "20030911";
+
+// 将 "你的访问令牌" 替换为在 ThingsBoard Cloud 上创建设备后得到的 Token
+// 注意：如果你使用 HTTPS，请将下面的开头改为 "https://"
+const char* THINGSBOARD_URL  = "http://thingsboard.cloud/api/v1/Uib8mEAPDYsGw2RhEEZS/telemetry";
+
 /*******************************************************
  * MAX30102 Sensor
  *******************************************************/
@@ -46,9 +48,9 @@ float totalGyro;
 unsigned long fallStartTime = 0;
 bool fallDetected = false;
 
-#define ACC_THRESHOLD 1.4    // Acceleration threshold (g)
-#define GYRO_THRESHOLD 250   // Angular velocity threshold (°/s)
-#define FALL_TIME_THRESHOLD 20// 100ms false alarm filter
+#define ACC_THRESHOLD 2.5    // Acceleration threshold (g)
+#define GYRO_THRESHOLD 300   // Angular velocity threshold (°/s)
+#define FALL_TIME_THRESHOLD 100 // 100ms false alarm filter
 
 /*******************************************************
  * GPS data (via TinyGPSPlus)
@@ -56,8 +58,8 @@ bool fallDetected = false;
 #define RXD2 16 
 #define TXD2 17  
 
-float g_lat = 45.5180288;
-float g_lng = -122.6801152;
+float g_lat = 45.58;
+float g_lng = -122.68;
 
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);  // Use UART2
@@ -174,8 +176,6 @@ void loop() {
  * heartRateTask (high frequency ~100Hz)
  * Reads IR from MAX30102, calculates BPM using PBA
  *******************************************************/
-const unsigned long imuTempInterval = 1000;
-static unsigned long lastImuTempTime = 0; 
 void heartRateTask(void* pvParameters) {
   const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms -> ~100Hz
   TickType_t xLastWakeTime    = xTaskGetTickCount();
@@ -238,8 +238,8 @@ void uploadTask(void* pvParameters) {
       fallDetected
     );
 
-    // 6) Send to Firebase
-    sendDataToFirebase(jsonData);
+    // 4) Send to ThingsBoard
+    sendDataToThingsBoard(jsonData);
 
     // 5) Debug Print
     Serial.println(jsonData);
@@ -317,21 +317,21 @@ void initMPU6050() {
  * readMPU() 
  * Reads accelerometer & gyro data
  *******************************************************/
-void readMPU(int16_t &ax, int16_t &ay, int16_t &az,
-             int16_t &gx, int16_t &gy, int16_t &gz) {
+void readMPU(int16_t &axf, int16_t &ayf, int16_t &azf,
+             int16_t &gxf, int16_t &gyf, int16_t &gzf) {
   mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-  acc_ax = ax / 16384.0;  // 2g range => 16384 LSB/g
-  acc_ay = ay / 16384.0;
-  acc_az = az / 16384.0;
-  gyro_gx = gx / 131.0;    // 250°/s range => 131 LSB/(°/s)
-  gyro_gy = gy / 131.0;
-  gyro_gz = gz / 131.0;
+  axf = ax / 16384.0;  // 2g range => 16384 LSB/g
+  ayf = ay / 16384.0;
+  azf = az / 16384.0;
+  gxf = gx / 131.0;    // 250°/s range => 131 LSB/(°/s)
+  gyf = gy / 131.0;
+  gzf = gz / 131.0;
 
   // Calculate total acceleration
-  totalAcc = sqrt(acc_ax * acc_ax + acc_ay * acc_ay + acc_az * acc_az);
+  totalAcc = sqrt(axf * axf + ayf * ayf + azf * azf);
   // Calculate total angular velocity
-  totalGyro = sqrt(gyro_gx * gyro_gx + gyro_gy * gyro_gy + gyro_gz * gyro_gz);
+  totalGyro = sqrt(gxf * gxf + gyf * gyf + gzf * gzf);
 
   // Detect a fall
   if (totalAcc > ACC_THRESHOLD && totalGyro > GYRO_THRESHOLD) {
@@ -404,17 +404,18 @@ String createJson(float bpm, int avgBpm, bool emergency,
 }
 
 /*******************************************************
- * sendDataToFirebase()
+ * sendDataToThingsBoard()
+ * HTTP POST to ThingsBoard Cloud
  *******************************************************/
-void sendDataToFirebase(const String &jsonPayload) {
+void sendDataToThingsBoard(const String &jsonPayload) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(FIREBASE_URL);
+    http.begin(THINGSBOARD_URL);
     http.addHeader("Content-Type", "application/json");
 
     int httpResponseCode = http.POST(jsonPayload);
     if (httpResponseCode > 0) {
-      Serial.printf("Firebase POST response code: %d\n", httpResponseCode);
+      Serial.printf("ThingsBoard POST response code: %d\n", httpResponseCode);
     } else {
       Serial.printf("Error in POST: %d\n", httpResponseCode);
     }
@@ -423,6 +424,7 @@ void sendDataToFirebase(const String &jsonPayload) {
     Serial.println("WiFi not connected. Cannot send data.");
   }
 }
+
 /*******************************************************
  * setupWiFi()
  *******************************************************/

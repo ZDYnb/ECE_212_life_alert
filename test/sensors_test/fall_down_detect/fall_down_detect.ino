@@ -29,6 +29,15 @@ void loop() {
     // Read acceleration & angular velocity data
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
+  // 打印处理前的原始数据
+  Serial.print("Raw Data -> ");
+  Serial.print("AX: "); Serial.print(ax);
+  Serial.print(" AY: "); Serial.print(ay);
+  Serial.print(" AZ: "); Serial.print(az);
+  Serial.print(" | GX: "); Serial.print(gx);
+  Serial.print(" GY: "); Serial.print(gy);
+  Serial.print(" GZ: "); Serial.println(gz);
+  
     // Convert to actual physical units
     acc_x = ax / 16384.0; // 2g range
     acc_y = ay / 16384.0;
