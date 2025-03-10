@@ -14,14 +14,16 @@
 #include <HardwareSerial.h>
 #include <time.h>
 
-
+const char* apiKey = "";
+const char* googleApiUrl = "";
 
 /*******************************************************
  *  WiFi and Firebase Settings
  *******************************************************/
-const char* WIFI_SSID     = "ZDYNB";
-const char* WIFI_PASSWORD = "20030911";
-const char* FIREBASE_URL  = "https://lifealert-40baf-default-rtdb.firebaseio.com/sensorData.json";
+
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+const char* FIREBASE_URL  = "";
 /*******************************************************
  * MAX30102 Sensor
  *******************************************************/
@@ -65,7 +67,7 @@ HardwareSerial gpsSerial(2);  // Use UART2
 /*******************************************************
  * Emergency Button on pin 12 (active LOW)
  *******************************************************/
-const int buttonPin = 12;
+const int buttonPin = 13;
 volatile bool g_emergencyTriggered = false;
 void IRAM_ATTR handleEmergency() {
   g_emergencyTriggered = true;
@@ -107,7 +109,10 @@ String createJson(float bpm, int avgBpm, bool emergency,
                   float gyro_gx, float gyro_gy, float gyro_gz,
                   float totalAcc, float totalGyro,
                   bool fallDetected);
-void sendDataToThingsBoard(const String &jsonPayload);
+void sendDataToFirebase(const String &jsonPayload);
+
+void getGeolocation();
+String getWiFiAccessPoints();
 
 /*******************************************************
  * setup()
@@ -141,26 +146,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(buttonPin), handleEmergency, FALLING);
 
   // Create the high-frequency heart-rate task (Core 0)
-  xTaskCreatePinnedToCore(
-    heartRateTask,        
-    "HeartRateTask",      
-    4096,                 
-    NULL,
-    2,                     // priority
-    &heartRateTaskHandle,
-    0                      // pinned to core 0
-  );
+// 低频数据上传任务 (Core 0) - 主要运行 WiFi / Firebase
+xTaskCreatePinnedToCore(uploadTask, "UploadTask", 10240, NULL, 1, &uploadTaskHandle, 0);
 
-  // Create the lower-frequency upload task (Core 1)
-  xTaskCreatePinnedToCore(
-    uploadTask,
-    "UploadTask",
-    4096,
-    NULL,
-    1,                     // lower priority
-    &uploadTaskHandle,
-    1                      // pinned to core 1
-  );
+// 高频心率监测任务 (Core 1) - 避免 WiFi 干扰
+xTaskCreatePinnedToCore(heartRateTask, "HeartRateTask", 3072, NULL, 2, &heartRateTaskHandle, 1);
+
 }
 
 /*******************************************************
@@ -174,39 +165,43 @@ void loop() {
  * heartRateTask (high frequency ~100Hz)
  * Reads IR from MAX30102, calculates BPM using PBA
  *******************************************************/
-const unsigned long imuTempInterval = 1000;
-static unsigned long lastImuTempTime = 0; 
 void heartRateTask(void* pvParameters) {
-  const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms -> ~100Hz
+  // 期待 10ms 间隔 (~100Hz)
+  const TickType_t xFrequency = pdMS_TO_TICKS(10);
   TickType_t xLastWakeTime    = xTaskGetTickCount();
 
+  // 用来记录两次循环之间的间隔
+  static unsigned long lastLoopMillis = 0;
+
   while (true) {
+    // 1) 等待固定时间 (10ms)
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    // Read IR data from sensor
+    // 2) 记录本次循环起始时间，用于测量整体循环的毫秒级间隔
+    // unsigned long currentMillis = millis();
+    // unsigned long loopDelta = currentMillis - lastLoopMillis;
+    // lastLoopMillis = currentMillis;
+    //Serial.printf("[heartRateTask] %lu ms since last loop\n", loopDelta);
+
+    // 3) 开始分步骤测量微秒级时间
+    // unsigned long stepStart = micros();
+
+    // (a) Read IR and compute BPM
     long irValue = particleSensor.getIR();
     checkBeatAndComputeBPM(irValue);
 
-    // Read IMU data
+    // unsigned long afterIR = micros();
+    //Serial.printf("   IR & BPM processing: %lu us\n", afterIR - stepStart);
+
+    // (b) Read IMU data
     readMPU(ax, ay, az, gx, gy, gz);
 
-    // Read internal temperature from MAX30102
-    temperature = readDieTemperature();
+    // unsigned long afterIMU = micros();
+    //Serial.printf("   IMU read: %lu us\n", afterIMU - stepStart);
 
-    // Read GPS if available
-    if (gpsSerial.available() > 0) {
-      char c = gpsSerial.read();
-      gps.encode(c); 
-      if (gps.location.isUpdated()) {
-        g_lat = gps.location.lat();
-        g_lng = gps.location.lng();
-      }
-    }
   }
-
   vTaskDelete(NULL);
 }
-
 /*******************************************************
  * uploadTask (lower frequency ~1Hz)
  * Builds JSON, sends to ThingsBoard
@@ -214,9 +209,16 @@ void heartRateTask(void* pvParameters) {
 void uploadTask(void* pvParameters) {
   const TickType_t xFrequency = pdMS_TO_TICKS(1000); // 1 second
   TickType_t xLastWakeTime    = xTaskGetTickCount();
-
+  int locationUpdateCounter = 0;  
+  const int LOCATION_UPDATE_INTERVAL = 30; 
   while (true) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+
+
+    // // (B) Record the start time of this loop iteration
+    // unsigned long loopStart = micros();
+
 
     // 1) Copy heart-rate data
     float currentBpm = g_beatsPerMinute;
@@ -225,7 +227,32 @@ void uploadTask(void* pvParameters) {
     // 2) Check emergency
     bool localEmergency = g_emergencyTriggered;
     g_emergencyTriggered = false;
+   
+       // 4) Read temperature
+    // unsigned long stepStart = micros();
+    temperature = readDieTemperature();
+    // unsigned long afterTemp = micros();
+    // Serial.printf("[uploadTask]   Die temperature read: %lu us\n", afterTemp - stepStart);
+    // stepStart = afterTemp;
 
+    // (d) Read GPS if available
+    if (gpsSerial.available() > 0) {
+      char c = gpsSerial.read();
+      gps.encode(c);
+      if (gps.location.isUpdated()) {
+        g_lat = gps.location.lat();
+        g_lng = gps.location.lng();
+      }
+    }
+
+    if (locationUpdateCounter >= LOCATION_UPDATE_INTERVAL) {
+    getGeolocation();
+    locationUpdateCounter = 0; 
+    }
+    locationUpdateCounter++;
+
+    // unsigned long afterGPS = micros();
+    // Serial.printf("   GPS check: %lu us\n", afterGPS - stepStart);
     // 3) Build JSON
     String jsonData = createJson(
       currentBpm, currentAvg,
@@ -237,12 +264,19 @@ void uploadTask(void* pvParameters) {
       totalAcc, totalGyro,
       fallDetected
     );
-
+    // unsigned long afterJSON = micros();
+    // Serial.printf("              JSON build: %lu us\n", afterJSON - afterGPS);
     // 6) Send to Firebase
     sendDataToFirebase(jsonData);
-
+    // unsigned long afterFirebase = micros();
+    // Serial.printf("              Firebase send: %lu us\n", afterFirebase - stepStart);
     // 5) Debug Print
     Serial.println(jsonData);
+    // Serial.println("--------------------------------------------------");
+
+    //     // (H) Measure total loop time
+    // unsigned long loopEnd = micros();
+    // Serial.printf("[uploadTask] Total loop time: %lu us\n\n", (loopEnd - loopStart));
   }
   vTaskDelete(NULL);
 }
@@ -256,10 +290,9 @@ void checkBeatAndComputeBPM(long irValue) {
     long delta = millis() - g_lastBeat;
     g_lastBeat = millis();
 
-    float bpm = 60.0 / (delta / 1000.0);
-    if (bpm < 255 && bpm > 20) {
-      g_beatsPerMinute = bpm;
-      g_rates[g_rateSpot++] = (byte)bpm;
+    g_beatsPerMinute = 60 / (delta / 1000.0);
+    if (g_beatsPerMinute < 255 && g_beatsPerMinute > 20) {
+      g_rates[g_rateSpot++] = (byte)g_beatsPerMinute;
       g_rateSpot %= 4;
 
       int total = 0;
@@ -286,8 +319,8 @@ void initMAX30102() {
   // Example configuration
   byte ledBrightness = 0x1F; // Options: 0=Off to 255=50mA
   byte sampleAverage = 8;    // Options: 1, 2, 4, 8, 16, 32
-  byte ledMode       = 3;    // Options: 1=Red only, 2=Red+IR, 3=Red+IR+Green
-  int sampleRate     = 100;  // Options: 50,100,200,400,800,1000,1600,3200
+  byte ledMode       = 2;    // Options: 1=Red only, 2=Red+IR, 3=Red+IR+Green
+  int sampleRate     = 3200;  // Options: 50,100,200,400,800,1000,1600,3200
   int pulseWidth     = 411;  // Options: 69,118,215,411
   int adcRange       = 4096; // Options: 2048,4096,8192,16384
 
@@ -368,20 +401,21 @@ String createJson(float bpm, int avgBpm, bool emergency,
 {
   StaticJsonDocument<512> doc;
 
-  // get the current time
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    char timeString[30];
-    strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    doc["timestamp"] = timeString;  
-  } else {
-    doc["timestamp"] = "NTP Sync Failed";
-  }
+if (getLocalTime(&timeinfo)) {
+    // 计算 Unix 时间戳
+    time_t unixTimestamp = mktime(&timeinfo)-7 * 3600;
+
+    // 存储 Unix 时间戳到 Firebase
+    doc["timestamp"] = unixTimestamp;
+} else {
+    doc["timestamp"] = 0;  // 如果时间同步失败，设为 0
+}
 
   doc["heart_rate"]  = bpm;
   doc["avg_bpm"]     = avgBpm;
   doc["emergency"]   = emergency;
-  doc["temperature"] = temperature;
+  doc["temperature"] = temperature - 3.5;
 
   JsonObject locObj = doc.createNestedObject("location");
   locObj["lat"]     = lat;
@@ -443,6 +477,7 @@ void setupWiFi() {
  * setupTime()
  * Set timezone and sync via NTP
  *******************************************************/
+
 void setupTime() {
   // 时区偏移量（秒）
   const long gmtOffset_sec = -8 * 3600;     // UTC-8 (冬季)
@@ -459,3 +494,61 @@ void setupTime() {
   }
   Serial.println("\nNTP 时间同步成功！");
 }
+
+/*******************************************************
+ * setupgooglewifi()
+ *******************************************************/
+String getWiFiAccessPoints() {
+
+    WiFi.disconnect();
+    delay(500);
+    int numNetworks = WiFi.scanNetworks(false, false, 5);
+    WiFi.reconnect();
+    
+    if (numNetworks == 0) {
+        Serial.println("⚠️ 未扫描到 WiFi 网络");
+        return "{\"wifiAccessPoints\": []}";
+    }
+
+    String jsonPayload;
+    jsonPayload.reserve(1024);
+
+    jsonPayload = "{\"wifiAccessPoints\": [";
+    for (int i = 0; i < numNetworks; i++) {
+        jsonPayload += "{\"macAddress\": \"" + WiFi.BSSIDstr(i) + "\",";
+        jsonPayload += "\"signalStrength\": " + String(WiFi.RSSI(i)) + "}";
+
+        if (i < numNetworks - 1) {
+            jsonPayload += ",";
+        }
+    }
+    jsonPayload += "]}";
+
+    return jsonPayload;
+}
+
+void getGeolocation() {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(googleApiUrl);
+        http.addHeader("Content-Type", "application/json");
+
+        String jsonPayload = getWiFiAccessPoints();
+        int httpResponseCode = http.POST(jsonPayload);
+
+        if (httpResponseCode > 0) {
+            String response = http.getString();
+
+            DynamicJsonDocument doc(1024);
+            DeserializationError error = deserializeJson(doc, response);
+            
+            if (!error) {
+                g_lat = doc["location"]["lat"];
+                g_lng = doc["location"]["lng"];
+            }
+        }
+
+        http.end();
+    }
+}
+
